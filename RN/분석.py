@@ -1,52 +1,121 @@
-import FinanceDataReader as fdr
-import pandas as pd
+import json
+import math
 from datetime import datetime, timedelta
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+
+
+def get_krx_market_top_400():
+    """네이버 금융에서 시가총액 상위 400개 종목의 코드, 이름, 현재가, 시가총액을 크롤링합니다."""
+    print("네이버 금융에서 시장 전체 종목 데이터 수집 중...")
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+
+    stocks = []
+    # 코스피(0), 코스닥(1)에서 상위 종목 수집 (각 4페이지씩 수집하여 충분한 풀 확보)
+    for market_code in [0, 1]:
+        for page in range(1, 5):
+            url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={market_code}&page={page}"
+            res = requests.get(url, headers=headers)
+            soup = BeautifulSoup(res.text, 'html.parser')
+
+            table = soup.find('table', {'class': 'type_2'})
+            if not table:
+                continue
+
+            rows = table.find_all('tr')
+            for row in rows:
+                cols = row.find_all('td')
+                if len(cols) < 12:
+                    continue
+
+                # 종목명 및 코드 추출
+                a_tag = cols[1].find('a')
+                if not a_tag:
+                    continue
+                name = a_tag.text.strip()
+                code = a_tag['href'].split('code=')[-1]
+
+                # 현재가 및 시가총액 추출
+                try:
+                    current_price = int(cols[2].text.replace(',', '').strip())
+                    # 네이버 시총은 '억' 단위이므로 원화로 환산
+                    m_cap = int(cols[6].text.replace(',', '').strip()) * 100000000
+                except ValueError:
+                    continue
+
+                stocks.append({
+                    'Code': code,
+                    'Name': name,
+                    'Close': current_price,
+                    'Marcap': m_cap
+                })
+
+    df = pd.DataFrame(stocks)
+    if df.empty:
+        return df
+
+    # 중복 제거 및 시총 3,000억 이상 필터링 후 상위 400개 반환
+    df = df.drop_duplicates(subset=['Code'])
+    df = df[df['Marcap'] >= 300000000000]
+    df = df.sort_values(by='Marcap', ascending=False).head(400)
+    return df
+
+
+def get_naver_historical_data(symbol, days=120):
+    """네이버 일별시세 API(JSON식 차트 데이터)를 활용해 안정적으로 과거 시세를 가져옵니다."""
+    url = f"https://fchart.stock.naver.com/sise.nhn?symbol={symbol}&timeframe=day&count={days}&requestType=0"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+
+    res = requests.get(url, headers=headers)
+    soup = BeautifulSoup(res.text, 'xml')
+    items = soup.find_all('item')
+
+    hist_data = []
+    for item in items:
+        data_str = item.get('data')
+        if not data_str:
+            continue
+        # 데이터 포맷: "날짜|시가|고가|저가|종가|거래량"
+        tokens = data_str.split('|')
+        if len(tokens) >= 6:
+            hist_data.append({
+                'Date': tokens[0],
+                'High': int(tokens[2]),
+                'Close': int(tokens[4]),
+                'Volume': int(tokens[5])
+            })
+
+    return pd.DataFrame(hist_data)
 
 
 def get_rn_expanded_targets():
-    print("시장 전체 종목 분석 중... (시총 3,000억 이상 대상)")
-
-    # 1. KRX 전체 종목 리스트 불러오기
-    df_krx = fdr.StockListing('KRX')
-
-    # [수정] 대소문자 구분 없이 시가총액 컬럼 매칭 (보내주신 목록의 'Marcap' 대응)
-    mcap_col = None
-    # 사용자가 보내준 인덱스 목록에 'Marcap'이 있으므로 이를 우선 확인
-    for col in ['Marcap', 'MarCap', 'MarketCap', '시가총액']:
-        if col in df_krx.columns:
-            mcap_col = col
-            break
-
-    if not mcap_col:
-        print("에러: 시가총액 컬럼을 찾을 수 없습니다. 현재 컬럼:", df_krx.columns)
+    df_filtered = get_krx_market_top_400()
+    if df_filtered.empty:
+        print("에러: 시장 데이터를 수집하지 못했습니다.")
         return pd.DataFrame()
 
-    # 2. 데이터 정제
-    df_krx[mcap_col] = pd.to_numeric(df_krx[mcap_col], errors='coerce')
-
-    # 시가총액 3,000억 이상 필터링
-    df_filtered = df_krx[df_krx[mcap_col] >= 300000000000].copy()
-
-    # 분석 속도를 위해 시총 상위 400개만 정밀 분석
-    df_filtered = df_filtered.sort_values(by=mcap_col, ascending=False).head(400)
+    print(f"시총 3,000억 이상 상위 {len(df_filtered)}개 종목 정밀 분석 시작...")
 
     # RN 기준 가격 설정
     base_units = [1000, 1500, 2000, 3000, 5000, 7500]
     rn_levels = []
-    for i in range(0, 7):  # 1,000원부터 1,000만원대까지 커버
+    for i in range(0, 7):
         multiplier = 10 ** i
         rn_levels.extend([u * multiplier for u in base_units])
     rn_levels = sorted(list(set(rn_levels)))
 
     results = []
-    end_date = datetime.now().strftime('%Y-%m-%d')
-    start_date = (datetime.now() - timedelta(days=120)).strftime('%Y-%m-%d')
 
     for idx, row in df_filtered.iterrows():
         symbol = row['Code']
         name = row['Name']
         current_price = row['Close']
-        m_cap = row[mcap_col]
+        m_cap = row['Marcap']
 
         # RN존 설정 (상단선/매수선)
         upper_candidates = [level for level in rn_levels if level >= current_price]
@@ -61,17 +130,22 @@ def get_rn_expanded_targets():
             # 매수선(RN존) 4% 이내 진입 여부
             if 0 <= distance_to_lower <= 4.0:
                 try:
-                    df_hist = fdr.DataReader(symbol, start_date, end_date)
-                    if df_hist.empty: continue
+                    # 120일 치 일별 데이터 조회
+                    df_hist = get_naver_historical_data(symbol, days=120)
+                    if df_hist.empty:
+                        continue
 
-                    highest_2m = df_hist['High'].max()
+                    # 최근 2개월(대략 40영업일) 최고가 계산
+                    df_2m = df_hist.tail(40)
+                    highest_2m = df_2m['High'].max()
 
                     # [조건 1] 최근 2개월 내 상단선 터치 여부
                     is_upper_touched = highest_2m >= (upper_rn * 0.99)
 
-                    # [조건 2] 시총 10조 미만은 최고 거래대금 1,500억 이상 기록 체크
-                    # 10조 = 10,000,000,000,000
-                    max_vol_val = (df_hist['Volume'] * df_hist['Close']).max()
+                    # [조건 2] 시총 10조 미만은 최고 거래대금 1,500억 이상 체크
+                    # 거래대금 = 거래량 * 종가
+                    df_hist['VolVal'] = df_hist['Volume'] * df_hist['Close']
+                    max_vol_val = df_hist['VolVal'].max()
                     is_heavy = True if m_cap >= 10e12 else (max_vol_val >= 150000000000)
 
                     if is_upper_touched and is_heavy:
@@ -83,7 +157,7 @@ def get_rn_expanded_targets():
                             '매수선': f"{int(lower_rn):,}",
                             '거리': f"{distance_to_lower:.2f}%"
                         })
-                except:
+                except Exception as e:
                     continue
 
     return pd.DataFrame(results)
@@ -95,6 +169,6 @@ if __name__ == "__main__":
         print("\n" + "=" * 85)
         print("★ [RN존 최종 필터링] 상단 터치 완료 & 매수권 진입 종목 ★")
         print("=" * 85)
-        print(final_df)
+        print(final_df.to_string(index=False))
     else:
         print("\n[알림] 현재 기법 조건(상단 터치 + 매수선 4% 이내)에 맞는 종목이 없습니다.")
